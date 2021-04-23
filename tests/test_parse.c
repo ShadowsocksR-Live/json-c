@@ -42,6 +42,7 @@ static void single_incremental_parse(const char *test_string, int clear_serializ
 	json_object *all_at_once_obj, *new_obj;
 	const char *all_at_once_str, *new_str;
 
+	assert(chunksize > 0);
 	all_at_once_obj = json_tokener_parse(test_string);
 	if (clear_serializer)
 		do_clear_serializer(all_at_once_obj);
@@ -141,16 +142,18 @@ static void test_basic_parse()
 
 	single_basic_parse("12", 0);
 	single_basic_parse("12.3", 0);
-	single_basic_parse("12.3.4", 0); /* non-sensical, returns null */
-	/* was returning (int)2015 before patch, should return null */
-	single_basic_parse("2015-01-15", 0);
 
-	/* ...but this works.  It's rather inconsistent, and a future major release
-	 * should change the behavior so it either always returns null when extra
-	 * bytes are present (preferred), or always return object created from as much
-	 * as was able to be parsed.
+	/* Even though, when using json_tokener_parse() there's no way to
+	 *  know when there is more data after the parsed object,
+	 *  an object is successfully returned anyway (in some cases)
 	 */
+
+	single_basic_parse("12.3.4", 0);
+	single_basic_parse("2015-01-15", 0);
 	single_basic_parse("12.3xxx", 0);
+	single_basic_parse("12.3{\"a\":123}", 0);
+	single_basic_parse("12.3\n", 0);
+	single_basic_parse("12.3 ", 0);
 
 	single_basic_parse("{\"FoO\"  :   -12.3E512}", 0);
 	single_basic_parse("{\"FoO\"  :   -12.3e512}", 0);
@@ -343,8 +346,36 @@ struct incremental_step
     /* This should parse as the number 12, since it continues the "1" */
     {"2", 2, 1, json_tokener_success, 0},
     {"12{", 3, 2, json_tokener_success, 1},
-    /* Parse number in strict model */
+    /* Parse number in strict mode */
     {"[02]", -1, 3, json_tokener_error_parse_number, 1, JSON_TOKENER_STRICT},
+
+    {"0e+0", 5, 4, json_tokener_success, 1},
+    {"[0e+0]", -1, -1, json_tokener_success, 1},
+
+    /* The behavior when missing the exponent varies slightly */
+    {"0e", 2, 2, json_tokener_continue, 1},
+    {"0e", 3, 2, json_tokener_success, 1},
+    {"0e", 3, 2, json_tokener_error_parse_eof, 1, JSON_TOKENER_STRICT},
+    {"[0e]", -1, -1, json_tokener_success, 1},
+    {"[0e]", -1, 3, json_tokener_error_parse_number, 1, JSON_TOKENER_STRICT},
+
+    {"0e+", 3, 3, json_tokener_continue, 1},
+    {"0e+", 4, 3, json_tokener_success, 1},
+    {"0e+", 4, 3, json_tokener_error_parse_eof, 1, JSON_TOKENER_STRICT},
+    {"[0e+]", -1, -1, json_tokener_success, 1},
+    {"[0e+]", -1, 4, json_tokener_error_parse_number, 1, JSON_TOKENER_STRICT},
+
+    {"0e-", 3, 3, json_tokener_continue, 1},
+    {"0e-", 4, 3, json_tokener_success, 1},
+    {"0e-", 4, 3, json_tokener_error_parse_eof, 1, JSON_TOKENER_STRICT},
+    {"[0e-]", -1, -1, json_tokener_success, 1},
+    {"[0e-]", -1, 4, json_tokener_error_parse_number, 1, JSON_TOKENER_STRICT},
+
+    /* You might expect this to fail, but it won't because
+	   it's a valid partial parse; note the char_offset: */
+    {"0e+-", 5, 3, json_tokener_success, 1},
+    {"0e+-", 5, 3, json_tokener_error_parse_number, 1, JSON_TOKENER_STRICT},
+    {"[0e+-]", -1, 4, json_tokener_error_parse_number, 1},
 
     /* Similar tests for other kinds of objects: */
     /* These could all return success immediately, since regardless of
@@ -422,11 +453,22 @@ struct incremental_step
     {"{\"a\":1}{\"b\":2}", 15, 7, json_tokener_success, 0},
     {&"{\"a\":1}{\"b\":2}"[7], 8, 7, json_tokener_success, 1},
 
-    /* Some bad formatting. Check we get the correct error status
-     * XXX this means we can't have two numbers in the incremental parse
-     * XXX stream with the second one being a negative number!
-     */
-    {"2015-01-15", 10, 4, json_tokener_error_parse_number, 1},
+    /*
+	 * Though this may seem invalid at first glance, it
+	 * parses as three separate numbers, 2015, -1 and -15
+	 * Of course, simply pasting together a stream of arbitrary
+	 * positive numbers won't work, since there'll be no way to
+     * tell where in e.g. "2015015" the next number stats, so
+	 * a reliably parsable stream must not include json_type_int
+	 * or json_type_double objects without some other delimiter.
+	 * e.g. whitespace
+	 */
+    {&"2015-01-15"[0], 11, 4, json_tokener_success, 1},
+    {&"2015-01-15"[4], 7, 3, json_tokener_success, 1},
+    {&"2015-01-15"[7], 4, 3, json_tokener_success, 1},
+    {&"2015 01 15"[0], 11, 5, json_tokener_success, 1},
+    {&"2015 01 15"[4], 7, 4, json_tokener_success, 1},
+    {&"2015 01 15"[7], 4, 3, json_tokener_success, 1},
 
     /* Strings have a well defined end point, so we can stop at the quote */
     {"\"blue\"", -1, -1, json_tokener_success, 0},

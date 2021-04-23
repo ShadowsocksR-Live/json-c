@@ -97,6 +97,8 @@ static const char *json_tokener_errors[] = {
  */
 static json_bool json_tokener_validate_utf8(const char c, unsigned int *nBytes);
 
+static int json_tokener_parse_double(const char *buf, int len, double *retval);
+
 const char *json_tokener_error_desc(enum json_tokener_error jerr)
 {
 	int jerr_int = (int)jerr;
@@ -132,6 +134,12 @@ struct json_tokener *json_tokener_new_ex(int depth)
 		return NULL;
 	}
 	tok->pb = printbuf_new();
+	if (!tok->pb)
+	{
+		free(tok);
+		free(tok->stack);
+		return NULL;
+	}
 	tok->max_depth = depth;
 	json_tokener_reset(tok);
 	return tok;
@@ -191,7 +199,17 @@ struct json_object *json_tokener_parse_verbose(const char *str, enum json_tokene
 		return NULL;
 	obj = json_tokener_parse_ex(tok, str, -1);
 	*error = tok->err;
-	if (tok->err != json_tokener_success)
+	if (tok->err != json_tokener_success
+#if 0
+		/* This would be a more sensible default, and cause parsing
+		 * things like "null123" to fail when the caller can't know
+		 * where the parsing left off, but starting to fail would
+		 * be a notable behaviour change.  Save for a 1.0 release.
+		 */
+	    || json_tokener_get_parse_end(tok) != strlen(str)
+#endif
+	)
+
 	{
 		if (obj != NULL)
 			json_object_put(obj);
@@ -418,7 +436,7 @@ struct json_object *json_tokener_parse_ex(struct json_tokener *tok, const char *
 			{
 				char inf_char = *str;
 				if (!(tok->flags & JSON_TOKENER_STRICT))
-					inf_char = tolower((int)*str);
+					inf_char = tolower((unsigned char)*str);
 				if (inf_char != _json_inf_str[tok->st_pos])
 				{
 					tok->err = json_tokener_error_parse_unexpected;
@@ -836,9 +854,38 @@ struct json_object *json_tokener_parse_ex(struct json_tokener *tok, const char *
 			const char *case_start = str;
 			int case_len = 0;
 			int is_exponent = 0;
-			int negativesign_next_possible_location = 1;
-			while (c && strchr(json_number_chars, c))
+			int neg_sign_ok = 1;
+			int pos_sign_ok = 0;
+			if (printbuf_length(tok->pb) > 0)
 			{
+				/* We don't save all state from the previous incremental parse
+				   so we need to re-generate it based on the saved string so far.
+				 */
+				char *e_loc = strchr(tok->pb->buf, 'e');
+				if (!e_loc)
+					e_loc = strchr(tok->pb->buf, 'E');
+				if (e_loc)
+				{
+					char *last_saved_char =
+					    &tok->pb->buf[printbuf_length(tok->pb) - 1];
+					is_exponent = 1;
+					pos_sign_ok = neg_sign_ok = 1;
+					/* If the "e" isn't at the end, we can't start with a '-' */
+					if (e_loc != last_saved_char)
+					{
+						neg_sign_ok = 0;
+						pos_sign_ok = 0;
+					}
+					// else leave it set to 1, i.e. start of the new input
+				}
+			}
+
+			while (c && ((c >= '0' && c <= '9') ||
+			             (!is_exponent && (c == 'e' || c == 'E')) ||
+			             (neg_sign_ok && c == '-') || (pos_sign_ok && c == '+') ||
+			             (!tok->is_double && c == '.')))
+			{
+				pos_sign_ok = neg_sign_ok = 0;
 				++case_len;
 
 				/* non-digit characters checks */
@@ -847,40 +894,21 @@ struct json_object *json_tokener_parse_ex(struct json_tokener *tok, const char *
 				 * protected from input starting with '.' or
 				 * e/E.
 				 */
-				if (c == '.')
+				switch (c)
 				{
-					if (tok->is_double != 0)
-					{
-						/* '.' can only be found once, and out of the exponent part.
-						 * Thus, if the input is already flagged as double, it
-						 * is invalid.
-						 */
-						tok->err = json_tokener_error_parse_number;
-						goto out;
-					}
+				case '.':
 					tok->is_double = 1;
-				}
-				if (c == 'e' || c == 'E')
-				{
-					if (is_exponent != 0)
-					{
-						/* only one exponent possible */
-						tok->err = json_tokener_error_parse_number;
-						goto out;
-					}
+					pos_sign_ok = 1;
+					neg_sign_ok = 1;
+					break;
+				case 'e': /* FALLTHRU */
+				case 'E':
 					is_exponent = 1;
 					tok->is_double = 1;
 					/* the exponent part can begin with a negative sign */
-					negativesign_next_possible_location = case_len + 1;
-				}
-				if (c == '-' && case_len != negativesign_next_possible_location)
-				{
-					/* If the negative sign is not where expected (ie
-					 * start of input or start of exponent part), the
-					 * input is invalid.
-					 */
-					tok->err = json_tokener_error_parse_number;
-					goto out;
+					pos_sign_ok = neg_sign_ok = 1;
+					break;
+				default: break;
 				}
 
 				if (!ADVANCE_CHAR(str, tok) || !PEEK_CHAR(c, tok))
@@ -888,6 +916,20 @@ struct json_object *json_tokener_parse_ex(struct json_tokener *tok, const char *
 					printbuf_memappend_fast(tok->pb, case_start, case_len);
 					goto out;
 				}
+			}
+			/*
+				Now we know c isn't a valid number char, but check whether
+				it might have been intended to be, and return a potentially
+				more understandable error right away.
+				However, if we're at the top-level, use the number as-is
+			    because c can be part of a new object to parse on the
+				next call to json_tokener_parse().
+			 */
+			if (tok->depth > 0 && c != ',' && c != ']' && c != '}' && c != '/' &&
+			    c != 'I' && c != 'i' && !isspace((unsigned char)c))
+			{
+				tok->err = json_tokener_error_parse_number;
+				goto out;
 			}
 			if (case_len > 0)
 				printbuf_memappend_fast(tok->pb, case_start, case_len);
@@ -898,6 +940,22 @@ struct json_object *json_tokener_parse_ex(struct json_tokener *tok, const char *
 				state = json_tokener_state_inf;
 				tok->st_pos = 0;
 				goto redo_char;
+			}
+			if (tok->is_double && !(tok->flags & JSON_TOKENER_STRICT))
+			{
+				/* Trim some chars off the end, to allow things
+				   like "123e+" to parse ok. */
+				while (printbuf_length(tok->pb) > 1)
+				{
+					char last_char = tok->pb->buf[printbuf_length(tok->pb) - 1];
+					if (last_char != 'e' && last_char != 'E' &&
+					    last_char != '-' && last_char != '+')
+					{
+						break;
+					}
+					tok->pb->buf[printbuf_length(tok->pb) - 1] = '\0';
+					printbuf_length(tok->pb)--;
+				}
 			}
 		}
 			{
@@ -935,7 +993,8 @@ struct json_object *json_tokener_parse_ex(struct json_tokener *tok, const char *
 					}
 				}
 				else if (tok->is_double &&
-				         json_parse_double(tok->pb->buf, &numd) == 0)
+				         json_tokener_parse_double(
+				             tok->pb->buf, printbuf_length(tok->pb), &numd) == 0)
 				{
 					current = json_object_new_double_s(numd, tok->pb->buf);
 					if (current == NULL)
@@ -1203,4 +1262,13 @@ size_t json_tokener_get_parse_end(struct json_tokener *tok)
 {
 	assert(tok->char_offset >= 0); /* Drop this line when char_offset becomes a size_t */
 	return (size_t)tok->char_offset;
+}
+
+static int json_tokener_parse_double(const char *buf, int len, double *retval)
+{
+	char *end;
+	*retval = strtod(buf, &end);
+	if (buf + len == end)
+		return 0; // It worked
+	return 1;
 }
